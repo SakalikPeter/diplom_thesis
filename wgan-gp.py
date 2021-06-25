@@ -6,6 +6,8 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras import layers
 import pandas as pd
 from PIL import Image
+from numpy.random import randint
+from tensorflow.keras import backend as K
 import os
 
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
@@ -25,6 +27,8 @@ def load_real_data():
 
 def generate_real_samples(df):
     im_array = []
+    lbl_dict = {'Normal': 0, 'Benign': 1, 'InSitu': 2, 'Invasive':3}
+    lbl_array = []
 
     for _, row in df.iterrows():
         path = row[1]+'/'+row[0]
@@ -32,16 +36,18 @@ def generate_real_samples(df):
         im = im.convert('1')
         im = im.resize((28, 28))
         im_array.append(np.array(im))
+        lbl_array.append(lbl_dict[row[1]])
 
     im_array = np.array(np.float32(im_array))
+    lbl_array = np.array(lbl_array)
     im_array = (im_array - 127.5) / 127.5
     im_array = np.expand_dims(im_array, axis=3)
 
-    return im_array
+    return im_array, lbl_array
 
 
 df = load_real_data()
-train_images = generate_real_samples(df)
+train_images, train_labels = generate_real_samples(df)
 
 # ---------- PRIPRAVENIE DISKRIMINATORA ----------
 def conv_block(
@@ -68,6 +74,8 @@ def conv_block(
 
 
 def get_discriminator_model():
+    n_classes = 4
+
     img_input = layers.Input(shape=IMG_SHAPE)
     # Zero pad the input to make the input images size to (32, 32, 1).
     x = layers.ZeroPadding2D((2, 2))(img_input)
@@ -118,9 +126,10 @@ def get_discriminator_model():
 
     x = layers.Flatten()(x)
     x = layers.Dropout(0.2)(x)
-    x = layers.Dense(1)(x)
+    x1 = layers.Dense(1)(x)
+    x2 = layers.Dense(n_classes, activation='softmax')(x)
 
-    d_model = keras.models.Model(img_input, x, name="discriminator")
+    d_model = keras.models.Model(img_input, [x1, x2], name="discriminator")
     return d_model
 
 
@@ -157,14 +166,27 @@ def upsample_block(
 
 
 def get_generator_model():
+
+    n_classes = 4
+    in_label = layers.Input(shape=(1,))
+    # embedding for categorical input
+    li = layers.Embedding(n_classes, 50)(in_label)
+    # linear multiplication
+    n_nodes = 4 * 4
+    li = layers.Dense(n_nodes)(li)
+    # reshape to additional channel
+    li = layers.Reshape((4, 4, 1))(li)
+
     noise = layers.Input(shape=(noise_dim,))
     x = layers.Dense(4 * 4 * 256, use_bias=False)(noise)
     x = layers.BatchNormalization()(x)
     x = layers.LeakyReLU(0.2)(x)
-
     x = layers.Reshape((4, 4, 256))(x)
+
+    merge = layers.Concatenate()([x, li])
+
     x = upsample_block(
-        x,
+        merge,
         128,
         layers.LeakyReLU(0.2),
         strides=(1, 1),
@@ -190,7 +212,7 @@ def get_generator_model():
     # We will use a Cropping2D layer to make it (28, 28, 1).
     x = layers.Cropping2D((2, 2))(x)
 
-    g_model = keras.models.Model(noise, x, name="generator")
+    g_model = keras.models.Model([noise, in_label], x, name="generator")
     return g_model
 
 
@@ -214,12 +236,13 @@ class WGAN(keras.Model):
         self.d_steps = discriminator_extra_steps
         self.gp_weight = gp_weight
 
-    def compile(self, d_optimizer, g_optimizer, d_loss_fn, g_loss_fn):
+    def compile(self, d_optimizer, g_optimizer, d_loss_fn, g_loss_fn, d_loss_sce):
         super(WGAN, self).compile()
         self.d_optimizer = d_optimizer
         self.g_optimizer = g_optimizer
         self.d_loss_fn = d_loss_fn
         self.g_loss_fn = g_loss_fn
+        self.d_loss_sce = d_loss_sce
 
     def gradient_penalty(self, batch_size, real_images, fake_images):
         """ Calculates the gradient penalty.
@@ -244,12 +267,21 @@ class WGAN(keras.Model):
         gp = tf.reduce_mean((norm - 1.0) ** 2)
         return gp
 
-    def train_step(self, real_images):
-        if isinstance(real_images, tuple):
-            real_images = real_images[0]
+    def train_step(self, data):
+
+        if isinstance(data, tuple):
+            real_images = data[0]
+            real_labels = data[1]
+        
+        print(real_labels)
+        
 
         # Get the batch size
         batch_size = tf.shape(real_images)[0]
+        print('/////////////', batch_size)
+
+        # fake_labels = randint(0, 4, batch_size)
+
 
         # For each batch, we are going to perform the
         # following steps as laid out in the original paper:
@@ -269,16 +301,25 @@ class WGAN(keras.Model):
             random_latent_vectors = tf.random.normal(
                 shape=(batch_size, self.latent_dim)
             )
+            fake_labels = tf.random.uniform(
+                shape=(batch_size, 1), minval=0, maxval=3
+            )
+
             with tf.GradientTape() as tape:
                 # Generate fake images from the latent vector
-                fake_images = self.generator(random_latent_vectors, training=True)
+                fake_images = self.generator([random_latent_vectors, fake_labels], training=True)
                 # Get the logits for the fake images
-                fake_logits = self.discriminator(fake_images, training=True)
+                fake_logits, class_logits1 = self.discriminator(fake_images, training=True)
                 # Get the logits for the real images
-                real_logits = self.discriminator(real_images, training=True)
+                real_logits, class_logits2 = self.discriminator(real_images, training=True)
+
+                print('-------------')
+                print(class_logits1)
 
                 # Calculate the discriminator loss using the fake and real image logits
                 d_cost = self.d_loss_fn(real_img=real_logits, fake_img=fake_logits)
+                d_cost2 = self.d_loss_sce(real_labels, class_logits2)
+                d_cost3 = self.d_loss_sce(fake_labels, class_logits1)
                 # Calculate the gradient penalty
                 gp = self.gradient_penalty(batch_size, real_images, fake_images)
                 # Add the gradient penalty to the original discriminator loss
@@ -294,13 +335,17 @@ class WGAN(keras.Model):
         # Train the generator
         # Get the latent vector
         random_latent_vectors = tf.random.normal(shape=(batch_size, self.latent_dim))
+        fake_labels = tf.random.uniform(
+            shape=(batch_size, 1), minval=0, maxval=3
+        )
         with tf.GradientTape() as tape:
             # Generate fake images using the generator
-            generated_images = self.generator(random_latent_vectors, training=True)
+            generated_images = self.generator([random_latent_vectors, fake_labels], training=True)
             # Get the discriminator logits for fake images
-            gen_img_logits = self.discriminator(generated_images, training=True)
+            gen_img_logits, gen_class_logits = self.discriminator(generated_images, training=True)
             # Calculate the generator loss
             g_loss = self.g_loss_fn(gen_img_logits)
+            g_cost2 = self.d_loss_sce(fake_labels, gen_class_logits)
 
         # Get the gradients w.r.t the generator loss
         gen_gradient = tape.gradient(g_loss, self.generator.trainable_variables)
@@ -317,7 +362,10 @@ class GANMonitor(keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs=None):
         random_latent_vectors = tf.random.normal(shape=(self.num_img, self.latent_dim))
-        generated_images = self.model.generator(random_latent_vectors)
+        fake_labels = tf.random.uniform(
+            shape=(self.num_img, 1), minval=0, maxval=3
+        )
+        generated_images = self.model.generator([random_latent_vectors, fake_labels])
         generated_images = (generated_images * 127.5) + 127.5
 
         for i in range(self.num_img):
@@ -368,7 +416,8 @@ wgan.compile(
     g_optimizer=generator_optimizer,
     g_loss_fn=generator_loss,
     d_loss_fn=discriminator_loss,
+    d_loss_sce=tf.keras.losses.SparseCategoricalCrossentropy()
 )
 
 # Start training the model.
-wgan.fit(train_images, batch_size=BATCH_SIZE, epochs=epochs, shuffle=True, callbacks=[cbk])
+wgan.fit(train_images, train_labels, batch_size=BATCH_SIZE, epochs=epochs, shuffle=True, callbacks=[cbk])
