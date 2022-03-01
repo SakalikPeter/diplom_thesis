@@ -1,0 +1,12 @@
+albumentations==1.0.3
+numpy>=1.19.3
+packaging==21.0
+pandas==1.1.5
+tensorflow_gpu==2.3.0
+tensorflow-addons==0.13.0
+matplotlib==3.3.4
+opencv-python-headless>=4.4.0.46
+Pillow==8.3.2
+wandb>=0.10.30
+azureml_widgets==1.34.0
+azureml==0.2.7
